@@ -1,0 +1,1367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- Playables SDK -->
+
+<script type="module">
+  // Firebase v12 SDK
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.0/firebase-app.js";
+  import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.12.0/firebase-analytics.js";
+  import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.12.0/firebase-auth.js";
+  import { getFirestore, doc, setDoc, getDoc, updateDoc } from "https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyALZkJO3WZI3J-1Zm4hR-zsLaeqoW8UwHQ",
+    authDomain: "pragyabodha-1.firebaseapp.com",
+    projectId: "pragyabodha-1",
+    storageBucket: "pragyabodha-1.firebasestorage.app",
+    messagingSenderId: "480117101054",
+    appId: "1:480117101054:web:80b992d2d8f48e93ce70af",
+    measurementId: "G-D67REG5DGR"
+  };
+
+  // Initialize Firebase
+  const app = initializeApp(firebaseConfig);
+  const analytics = getAnalytics(app);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+
+  // Make available globally for the app script
+  window.fb = { auth, db, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, doc, setDoc, getDoc, updateDoc };
+  
+  // Dispatch event when Firebase is ready
+  window.dispatchEvent(new Event('firebase-ready'));
+</script>
+
+<script>// Playables SDK v1.0.0
+// Game lifecycle bridge: rAF-based game-ready detection + event communication
+(function() {
+  'use strict';
+
+  // Idempotency: skip if already initialized (e.g., server-side injection
+  // followed by client-side inject-javascript via the Bloks webview component).
+  if (window.playablesSDK) return;
+
+  var HANDLER_NAME = 'playablesGameEventHandler';
+  var ANDROID_BRIDGE_NAME = '_MetaPlayablesBridge';
+  var RAF_FRAME_THRESHOLD = 3;
+
+  var gameReadySent = false;
+  var firstInteractionSent = false;
+  var errorSent = false;
+  var frameCount = 0;
+  var originalRAF = window.requestAnimationFrame;
+
+  // --- Transport Layer ---
+
+  function hasIOSBridge() {
+    return !!(window.webkit &&
+              window.webkit.messageHandlers &&
+              window.webkit.messageHandlers[HANDLER_NAME]);
+  }
+
+  function hasAndroidBridge() {
+    return !!(window[ANDROID_BRIDGE_NAME] &&
+              typeof window[ANDROID_BRIDGE_NAME].postEvent === 'function');
+  }
+
+  function isInIframe() {
+    return !!(window.parent && window.parent !== window);
+  }
+
+  function sendEvent(eventName, payload) {
+    var message = {
+      type: eventName,
+      payload: payload || {},
+      timestamp: Date.now()
+    };
+
+    if (hasIOSBridge()) {
+      try {
+        window.webkit.messageHandlers[HANDLER_NAME].postMessage(message);
+      } catch (e) { /* ignore */ }
+      return;
+    }
+
+    if (hasAndroidBridge()) {
+    try {
+      var p = payload || {};
+      p.__secureToken = window.__fbAndroidBridgeAuthToken || '';
+      window[ANDROID_BRIDGE_NAME].postEvent(
+        eventName,
+        JSON.stringify(p)
+      );
+    } catch (e) { /* ignore */ }
+    return;
+  }
+
+    if (isInIframe()) {
+      try {
+        window.parent.postMessage(message, '*');
+      } catch (e) { /* ignore */ }
+      return;
+    }
+  }
+
+  // --- rAF Game-Ready Detection ---
+
+  function onFrame() {
+    if (gameReadySent) return;
+
+    frameCount++;
+    if (frameCount >= RAF_FRAME_THRESHOLD) {
+      gameReadySent = true;
+      sendEvent('game_ready', {
+        frame_count: frameCount,
+        detected_at: Date.now()
+      });
+      return;
+    }
+
+    originalRAF.call(window, onFrame);
+  }
+
+  if (originalRAF) {
+    window.requestAnimationFrame = function(callback) {
+      if (!gameReadySent) {
+        return originalRAF.call(window, function(timestamp) {
+          frameCount++;
+          if (frameCount >= RAF_FRAME_THRESHOLD && !gameReadySent) {
+            gameReadySent = true;
+            sendEvent('game_ready', {
+              frame_count: frameCount,
+              detected_at: Date.now()
+            });
+          }
+          callback(timestamp);
+        });
+      }
+      return originalRAF.call(window, callback);
+    };
+  }
+
+  // --- First User Interaction Detection ---
+
+  function setupFirstInteractionDetection() {
+    var events = ['touchstart', 'mousedown', 'keydown'];
+
+    function onFirstInteraction() {
+      if (firstInteractionSent) return;
+      firstInteractionSent = true;
+      sendEvent('user_interaction_start', null);
+
+      for (var i = 0; i < events.length; i++) {
+        document.removeEventListener(events[i], onFirstInteraction, true);
+      }
+    }
+
+    for (var i = 0; i < events.length; i++) {
+      document.addEventListener(events[i], onFirstInteraction, true);
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupFirstInteractionDetection);
+  } else {
+    setupFirstInteractionDetection();
+  }
+
+  // --- Auto Error Capture ---
+
+  window.addEventListener('error', function(event) {
+    if (errorSent) return;
+    errorSent = true;
+    sendEvent('error', {
+      message: event.message || 'Unknown error',
+      source: event.filename || '',
+      lineno: event.lineno || 0,
+      colno: event.colno || 0,
+      auto_captured: true
+    });
+  });
+
+  window.addEventListener('unhandledrejection', function(event) {
+    if (errorSent) return;
+    errorSent = true;
+    var reason = event.reason;
+    sendEvent('error', {
+      message: (reason instanceof Error) ? reason.message : String(reason),
+      type: 'unhandled_promise_rejection',
+      auto_captured: true
+    });
+  });
+
+  // --- Public API ---
+
+  window.playablesSDK = {
+    complete: function(score) {
+      sendEvent('game_ended', {
+        score: score,
+        completed: true
+      });
+    },
+
+    error: function(message) {
+      if (errorSent) return;
+      errorSent = true;
+      sendEvent('error', {
+        message: message || 'Unknown error',
+        auto_captured: false
+      });
+    },
+
+    sendEvent: function(eventName, payload) {
+      if (!eventName || typeof eventName !== 'string') return;
+      sendEvent(eventName, payload);
+    }
+  };
+
+  // Kick off rAF detection in case no game code calls rAF immediately
+  if (originalRAF) {
+    originalRAF.call(window, onFrame);
+  }
+})();</script>
+<script>window.Intl=window.Intl||{};Intl.t=function(s){return(Intl._locale&&Intl._locale[s])||s;};</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>PragyaBodha</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#fafbfc; --card:#ffffff; --border:#e5e7eb; --primary:#2563eb; --primary-hover:#1d4ed8;
+  --text:#111827; --text-2:#6b7280; --success:#059669; --warning:#d97706; --error:#dc2626;
+  --blue-bg:#eff6ff; --navy:#0f172a; --yellow-bg:#fffbeb; --yellow-bd:#fde68a;
+  --r-card:12px; --r-ctl:8px; --s8:8px; --s16:16px; --s24:24px; --s32:32px; --s48:48px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+h1,h2,h3{margin:0;font-weight:600;letter-spacing:-.01em}
+h1{font-size:24px}
+h2{font-size:18px}
+h3{font-size:16px}
+p{margin:0}
+button{font-family:inherit;font-size:14px;border:0;background:none;cursor:pointer;transition:all 150ms ease}
+a{color:var(--primary);text-decoration:none}
+a:hover{text-decoration:underline}
+input,select,textarea{font-family:inherit;font-size:14px}
+.icon{width:18px;height:18px;stroke:currentColor;stroke-width:1.75;fill:none;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-card);padding:var(--s24)}
+.btn{padding:10px 16px;border-radius:var(--r-ctl);font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover:not(:disabled){background:var(--primary-hover);filter:brightness(.95)}
+.btn-primary:active:not(:disabled){transform:scale(.98)}
+.btn-primary:disabled{opacity:.55;cursor:not-allowed}
+.btn-ghost{color:var(--text-2);padding:8px 12px;border-radius:var(--r-ctl)}
+.btn-ghost:hover{background:#f3f4f6}
+.btn-ghost:active{transform:scale(.98)}
+.btn-subtle{background:#f3f4f6;color:var(--text)}
+.btn-subtle:hover{background:#e5e7eb}
+.btn-subtle:active{transform:scale(.98)}
+.input,.select{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:var(--r-ctl);background:#fff;color:var(--text);outline:none;transition:all 150ms}
+.input:focus,.select:focus{border-color:var(--primary);box-shadow:0 0 0 2px rgba(37,99,235,.25)}
+.input-error{border-color:var(--error)!important;box-shadow:0 0 0 2px rgba(220,38,38,.18)!important}
+.label{font-weight:500;margin-bottom:6px;display:block;color:#374151}
+.hint{color:var(--text-2);font-size:12px;margin-top:4px}
+.error-text{color:var(--error);font-size:12px;margin-top:6px;display:none}
+.error-text.show{display:block}
+.badge{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:#f3f4f6;color:#374151}
+.badge-blue{background:var(--blue-bg);color:#1d4ed8}
+.badge-green{background:#ecfdf5;color:#065f46}
+.badge-yellow{background:#fffbeb;color:#92400e}
+.badge-red{background:#fef2f2;color:#991b1b}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+@media(max-width:960px){.grid-3,.grid-2{grid-template-columns:1fr}}
+.progress{height:8px;background:#f3f4f6;border-radius:999px;overflow:hidden}
+.progress>span{display:block;height:100%;background:var(--primary);border-radius:999px;transition:width .3s ease}
+.progress.thin{height:6px}
+
+/* LOGIN */
+#login-view{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.login-card{width:100%;max-width:380px;padding:32px}
+.login-logo{display:flex;align-items:center;gap:10px;font-weight:600;font-size:20px;margin-bottom:24px;justify-content:center}
+.login-foot{margin-top:16px;text-align:center;color:var(--text-2);font-size:12px}
+
+/* APP SHELL */
+#app-view{display:none}
+.app-shell{display:flex;min-height:100vh}
+.sidebar{width:220px;position:fixed;inset:0 auto 0 0;background:var(--card);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:30}
+.side-top{padding:20px 16px 12px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:600;font-size:18px}
+.nav{flex:1;padding:8px;overflow-y:auto}
+.nav-btn{width:100%;display:flex;align-items:center;gap:12px;padding:10px 12px 10px 16px;margin:2px 0;border-radius:8px;color:#374151;text-align:left;position:relative}
+.nav-btn:hover{background:#f9fafb}
+.nav-btn.active{background:var(--blue-bg);color:var(--primary);font-weight:500}
+.nav-btn.active::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:3px;background:var(--primary);border-radius:2px}
+.side-bottom{padding:12px;border-top:1px solid var(--border)}
+.logout-btn{width:100%;display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:8px;color:#6b7280}
+.logout-btn:hover{background:#f9fafb;color:#111827}
+.main{margin-left:220px;flex:1;min-width:0;display:flex;justify-content:center}
+.main-inner{width:100%;max-width:1200px;padding:32px}
+
+/* HEADER */
+.page-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:24px;gap:16px}
+.page-title{font-size:22px;font-weight:600}
+.page-sub{color:var(--text-2);font-size:13px;margin-top:2px}
+
+/* DASHBOARD */
+.metric{padding:20px}
+.metric-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.metric-val{font-size:28px;font-weight:600;letter-spacing:-.02em}
+.metric-sub{color:var(--text-2);font-size:13px;display:flex;align-items:center;gap:6px}
+.info-tip{position:relative;display:inline-flex}
+.info-tip:hover .tip-box{opacity:1;visibility:visible;transform:translateY(0)}
+.tip-box{position:absolute;left:50%;top:100%;transform:translate(-50%,4px);background:#111827;color:#fff;font-size:12px;padding:6px 8px;border-radius:6px;white-space:nowrap;opacity:0;visibility:hidden;transition:.15s;z-index:5;margin-top:4px}
+.planner{display:grid;grid-template-columns:320px 1fr;gap:32px}
+@media(max-width:900px){.planner{grid-template-columns:1fr}}
+.ctrl-group{margin-bottom:18px}
+.stepper{display:flex;align-items:center;gap:8px}
+.stepper-btn{width:32px;height:36px;border:1px solid var(--border);border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center}
+.stepper-btn:hover{background:#f9fafb}
+.stepper-btn:active{transform:scale(.96)}
+.stepper-input{width:70px;text-align:center}
+.life-stage{font-size:12px;color:var(--text-2);margin-top:6px}
+.pills{display:flex;gap:8px}
+.pill{flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:#fff;text-align:center;font-weight:500;color:#374151}
+.pill:hover{background:#f9fafb}
+.pill.active{background:var(--blue-bg);border-color:#bfdbfe;color:#1d4ed8}
+.alloc-row{padding:14px 0;border-bottom:1px solid #f3f4f6}
+.alloc-row:last-child{border-bottom:0}
+.alloc-top{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.alloc-name{font-weight:500;flex:1}
+.alloc-pct{font-size:12px;padding:2px 8px;border-radius:999px;background:#f3f4f6;font-weight:500}
+.alloc-amt{font-weight:500;min-width:80px;text-align:right}
+.alloc-note{font-size:12px;color:var(--text-2);margin-top:6px}
+.tip{margin-top:20px;padding:12px 14px;background:var(--yellow-bg);border:1px solid var(--yellow-bd);border-radius:10px;font-size:13px;color:#92400e;display:flex;gap:8px}
+
+/* GOALS */
+.empty{padding:48px 24px;text-align:center;color:var(--text-2)}
+.empty-ill{width:64px;height:64px;margin:0 auto 16px;opacity:.5}
+.goal-card{padding:20px;position:relative}
+.goal-top{display:flex;align-items:flex-start;gap:12px;margin-bottom:14px}
+.goal-name{font-weight:600;flex:1;font-size:15px}
+.priority-dot{width:8px;height:8px;border-radius:50%;margin-top:6px}
+.priority-dot.red{background:var(--error)}
+.priority-dot.yellow{background:var(--warning)}
+.priority-dot.green{background:var(--success)}
+.kebab{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--text-2)}
+.kebab:hover{background:#f3f4f6}
+.kebab-menu{position:absolute;right:16px;top:40px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.08);padding:4px;min-width:120px;z-index:10;display:none}
+.kebab-menu.show{display:block}
+.kebab-item{padding:8px 10px;border-radius:6px;width:100%;text-align:left;font-size:13px}
+.kebab-item:hover{background:#f9fafb}
+.goal-progress-text{display:flex;justify-content:space-between;font-size:13px;margin-bottom:8px}
+.goal-bottom{display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:13px;color:var(--text-2)}
+.add-funds{color:var(--primary);font-weight:500;cursor:pointer}
+.add-funds:hover{text-decoration:underline}
+.funds-inline{display:flex;gap:8px;margin-top:10px}
+
+/* CALCULATORS */
+.segmented{display:inline-flex;background:#f3f4f6;padding:4px;border-radius:10px;margin-bottom:20px}
+.seg-btn{padding:8px 16px;border-radius:8px;font-weight:500;color:#6b7280}
+.seg-btn.active{background:#fff;color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.calc-card{display:grid;grid-template-columns:1fr 340px;gap:0;overflow:hidden;padding:0}
+.calc-left{padding:24px}
+.calc-right{background:var(--navy);color:#fff;padding:28px;display:flex;flex-direction:column}
+@media(max-width:900px){.calc-card{grid-template-columns:1fr}.calc-right{border-top:1px solid rgba(255,255,255,.1)}}
+.calc-row{margin-bottom:20px}
+.calc-input-wrap{display:grid;grid-template-columns:1fr 110px;gap:12px;align-items:center;margin-top:8px}
+.slider{width:100%;height:6px;border-radius:999px;background:#e5e7eb;outline:none;-webkit-appearance:none}
+.slider::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--primary);border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.2);cursor:pointer}
+.slider::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--primary);border:2px solid #fff;cursor:pointer}
+.result-big{font-size:36px;font-weight:600;letter-spacing:-.02em;margin:8px 0 4px}
+.result-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;font-weight:600}
+.result-rows{margin-top:auto;padding-top:20px;border-top:1px solid rgba(255,255,255,.1);display:grid;gap:10px}
+.result-row{display:flex;justify-content:space-between;font-size:14px}
+.result-row span:first-child{color:#cbd5e1}
+.result-disc{font-size:11px;color:#94a3b8;margin-top:16px;line-height:1.4}
+
+/* LEARN */
+.learn-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px;flex-wrap:wrap}
+.search{position:relative;max-width:280px;width:100%}
+.search input{padding-left:34px}
+.search .icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#9ca3af}
+.tabs{display:flex;gap:20px;border-bottom:1px solid var(--border);margin-bottom:20px}
+.tab{padding:10px 2px;background:none;border:0;font-weight:500;color:var(--text-2);position:relative;cursor:pointer}
+.tab.active{color:var(--text)}
+.tab.active::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--primary)}
+.learn-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:1024px){.learn-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.learn-grid{grid-template-columns:1fr}}
+.learn-card{padding:18px;display:flex;flex-direction:column;height:100%;cursor:pointer;transition:transform 150ms}
+.learn-card:hover{transform:translateY(-2px)}
+.learn-tag{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+.learn-tag.blog{color:#2563eb}
+.learn-tag.govt{color:#059669}
+.learn-tag.news{color:#d97706}
+.learn-title{font-weight:600;margin-bottom:6px;font-size:15px;line-height:1.35}
+.learn-excerpt{color:var(--text-2);font-size:13px;line-height:1.45;flex:1;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.learn-meta{display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:12px;color:var(--text-2)}
+.learn-links{display:flex;gap:12px;margin-top:10px}
+.learn-links a{font-size:13px;font-weight:500}
+
+/* PROFILE */
+.profile-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.profile-grid{grid-template-columns:1fr}}
+.pref-row{display:grid;grid-template-columns:120px 1fr;gap:16px;align-items:center;margin-bottom:16px}
+.pref-row:last-child{margin-bottom:0}
+
+/* MODAL */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px;z-index:100;opacity:0;visibility:hidden;transition:.2s}
+.modal-backdrop.show{opacity:1;visibility:visible}
+.modal{background:#fff;border-radius:12px;border:1px solid var(--border);width:100%;max-width:520px;max-height:90vh;display:flex;flex-direction:column;transform:scale(.96);transition:.2s}
+.modal-backdrop.show .modal{transform:scale(1)}
+.modal-head{padding:18px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-body{padding:20px;overflow:auto}
+.modal-foot{padding:16px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px}
+.modal-close{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#6b7280}
+.modal-close:hover{background:#f3f4f6}
+.article-prose h3{font-size:18px;margin:20px 0 10px}
+.article-prose h4{font-size:15px;margin:16px 0 8px}
+.article-prose p{margin:0 0 12px;color:#374151;line-height:1.6}
+.article-prose ul{margin:0 0 12px 18px;color:#374151}
+.article-prose li{margin:4px 0}
+
+/* TOAST */
+#toast-container{position:fixed;right:20px;bottom:20px;z-index:200;display:flex;flex-direction:column;gap:10px}
+.toast{background:#111827;color:#fff;padding:12px 16px;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.2);display:flex;align-items:center;gap:10px;min-width:260px;transform:translateY(10px);opacity:0;animation:toastIn .25s forwards}
+@keyframes toastIn{to{transform:translateY(0);opacity:1}}
+.toast.hide{animation:toastOut .2s forwards}
+@keyframes toastOut{to{transform:translateY(10px);opacity:0}}
+
+/* SPINNER */
+.spinner{width:16px;height:16px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* MOBILE */
+@media(max-width:768px){
+  .sidebar{width:100%;height:64px;top:auto;bottom:0;flex-direction:row;align-items:stretch;border-top:1px solid var(--border);border-right:0;padding:0}
+  .side-top,.side-bottom{display:none}
+  .nav{flex:1;display:flex;padding:0;justify-content:space-around}
+  .nav-btn{flex-direction:column;gap:4px;padding:8px 4px;font-size:11px;justify-content:center;border-radius:0}
+  .nav-btn .icon{width:20px;height:20px}
+  .nav-btn span{font-size:11px}
+  .nav-btn.active{background:transparent;color:var(--primary)}
+  .nav-btn.active::before{display:none}
+  .main{margin-left:0;padding-bottom:72px}
+  .main-inner{padding:16px}
+  .page-head{flex-direction:column;align-items:flex-start}
+}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+</style>
+</head>
+<body>
+<!-- LOGIN -->
+<div id="login-view">
+  <div class="card login-card">
+    <div class="login-logo">
+      <svg class="icon" style="width:24px;height:24px;color:var(--primary)" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      PragyaBodha
+    </div>
+    <form id="login-form" novalidate>
+      <div style="margin-bottom:14px">
+        <label class="label" for="login-email">Email</label>
+        <input id="login-email" class="input" type="email" autocomplete="username" required placeholder="you@example.com">
+        <div class="error-text" id="login-email-err">Enter a valid email</div>
+      </div>
+      <div style="margin-bottom:18px">
+        <label class="label" for="login-pass">Password</label>
+        <input id="login-pass" class="input" type="password" autocomplete="current-password" required placeholder="••••••••">
+        <div class="hint">Use any password for demo</div>
+      </div>
+      <button class="btn btn-primary" style="width:100%" type="submit" id="login-btn">Log in</button>
+    </form>
+    
+        <div class="login-foot" style="margin-top:16px;text-align:center">
+          <a href="#" id="show-signup" style="color:var(--primary);text-decoration:none">Create account</a> • QA tested
+        </div>
+
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app-view">
+<div class="app-shell">
+  <aside class="sidebar" aria-label="Sidebar">
+    <div class="side-top">
+      <div class="logo">
+        <svg class="icon" style="color:var(--primary)" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        PragyaBodha
+      </div>
+    </div>
+    <nav class="nav" role="navigation">
+      <button class="nav-btn active" data-page="dashboard">
+        <svg class="icon" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        <span>Dashboard</span>
+      </button>
+      <button class="nav-btn" data-page="goals">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+        <span>Goals</span>
+      </button>
+      <button class="nav-btn" data-page="calculators">
+        <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="2"/><line x1="8" y1="6" x2="16" y2="6"/><line x1="8" y1="10" x2="16" y2="10"/><line x1="8" y1="14" x2="12" y2="14"/><line x1="8" y1="18" x2="12" y2="18"/></svg>
+        <span>Calculators</span>
+      </button>
+      <button class="nav-btn" data-page="learn">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>
+        <span>Learn</span>
+      </button>
+      <button class="nav-btn" data-page="profile">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <span>Profile</span>
+      </button>
+    </nav>
+    <div class="side-bottom">
+      <button class="logout-btn" id="logout">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <span>Logout</span>
+      </button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="main-inner">
+      <!-- DASHBOARD -->
+      <section class="page" id="page-dashboard">
+        <div class="page-head">
+          <div>
+            <h1 class="page-title" id="greeting">Good morning, Aarav</h1>
+            <div class="page-sub">Here's your financial pulse today</div>
+          </div>
+          <div class="page-sub" id="today-date"></div>
+        </div>
+
+        <div class="grid-3" style="margin-bottom:24px">
+          <div class="card metric">
+            <div class="metric-top">
+              <div style="font-weight:500;color:#374151">Monthly Surplus</div>
+              <div class="info-tip">
+                <svg class="icon" style="color:#9ca3af" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                <div class="tip-box">Surplus = Income − Expenses − Investments</div>
+              </div>
+            </div>
+            <div class="metric-val" id="m-surplus">₹35,000</div>
+            <div class="metric-sub" id="m-surplus-sub">30% of ₹1,16,667 income</div>
+          </div>
+          <div class="card metric">
+            <div class="metric-top"><div style="font-weight:500;color:#374151">Health Score</div></div>
+            <div class="metric-val" id="m-health">85</div>
+            <div class="metric-sub" id="m-health-sub">Excellent • 3/3 checks passed</div>
+          </div>
+          <div class="card metric">
+            <div class="metric-top"><div style="font-weight:500;color:#374151">5Y Projection</div></div>
+            <div class="metric-val" id="m-proj">₹11.3L</div>
+            <div class="metric-sub" id="m-proj-sub">At 8.6% blended return</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="planner">
+            <div>
+              <h2 style="margin-bottom:16px">Your Profile</h2>
+              <div class="ctrl-group">
+                <label class="label">Age</label>
+                <div class="stepper">
+                  <button class="stepper-btn" type="button" id="age-dec" aria-label="Decrease age">−</button>
+                  <input id="age-input" class="input stepper-input" type="number" min="18" max="70" value="22">
+                  <button class="stepper-btn" type="button" id="age-inc" aria-label="Increase age">+</button>
+                </div>
+                <div class="life-stage" id="life-stage">Early Career (18-25)</div>
+                <div class="error-text" id="age-err"></div>
+              </div>
+              <div class="ctrl-group">
+                <label class="label" for="income-input">Monthly Income</label>
+                <input id="income-input" class="input" inputmode="numeric" value="₹1,16,667">
+              </div>
+              <div class="ctrl-group">
+                <label class="label" for="invest-input">Invest per month</label>
+                <input id="invest-input" class="input" inputmode="numeric" value="₹20,000">
+                <div class="error-text" id="invest-err">Cannot invest more than you earn</div>
+              </div>
+              <div class="ctrl-group">
+                <label class="label">Risk</label>
+                <div class="pills" role="tablist">
+                  <button class="pill" data-risk="Low" type="button">Low</button>
+                  <button class="pill active" data-risk="Medium" type="button">Medium</button>
+                  <button class="pill" data-risk="High" type="button">High</button>
+                </div>
+              </div>
+              <div class="error-text" id="profile-err"></div>
+              <button class="btn btn-primary" id="update-plan" style="width:100%;margin-top:8px">Update Plan</button>
+            </div>
+            <div>
+              <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px">
+                <h2 id="alloc-title">Where your ₹20,000 goes</h2>
+              </div>
+              <div id="alloc-list">
+                <!-- rows injected -->
+              </div>
+              <div class="tip">
+                <span><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#d97706"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.9V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.1A7 7 0 0 0 12 2z"/></svg></span>
+                <span id="alloc-tip">At age 22, we recommend higher equity. This automatically reduces 1% each year.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- GOALS -->
+      <section class="page" id="page-goals" hidden>
+        <div class="page-head">
+          <div>
+            <h1 class="page-title">Goals</h1>
+            <div class="page-sub">Track and fund what matters</div>
+          </div>
+          <button class="btn btn-primary" id="add-goal-btn">
+            <svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Goal
+          </button>
+        </div>
+        <div id="goals-empty" class="card empty">
+          <div class="empty-ill">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+          </div>
+          <div style="font-weight:500;margin-bottom:4px;color:#111827">No goals yet</div>
+          <div>Start with your first goal</div>
+        </div>
+        <div class="grid-2" id="goals-grid" style="display:none"></div>
+      </section>
+
+      <!-- CALCULATORS -->
+      <section class="page" id="page-calculators" hidden>
+        <div class="page-head">
+          <div>
+            <h1 class="page-title">Calculators</h1>
+            <div class="page-sub">Plan with precision</div>
+          </div>
+        </div>
+        <div class="segmented" role="tablist">
+          <button class="seg-btn active" data-calc="sip">SIP</button>
+          <button class="seg-btn" data-calc="fd">Fixed Deposit</button>
+          <button class="seg-btn" data-calc="retirement">Retirement</button>
+        </div>
+        <div class="card calc-card">
+          <div class="calc-left" id="calc-left"></div>
+          <div class="calc-right">
+            <div class="result-label" id="calc-result-label">ESTIMATED WEALTH</div>
+            <div class="result-big" id="calc-result-big">₹11,61,695</div>
+            <div class="result-rows">
+              <div class="result-row"><span>You invest</span><span id="calc-invest">₹6,00,000</span></div>
+              <div class="result-row"><span>You gain</span><span id="calc-gain">₹5,61,695</span></div>
+            </div>
+            <div class="result-disc">Calculations are projections, not guarantees. Past performance does not indicate future returns.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- LEARN -->
+      <section class="page" id="page-learn" hidden>
+        <div class="learn-head">
+          <h1 class="page-title">Learn</h1>
+          <div class="search">
+            <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input id="learn-search" class="input" placeholder="Search articles, schemes...">
+          </div>
+        </div>
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="all">All</button>
+          <button class="tab" data-tab="blogs">Blogs</button>
+          <button class="tab" data-tab="schemes">Schemes</button>
+          <button class="tab" data-tab="news">News</button>
+        </div>
+        <div class="learn-grid" id="learn-grid"></div>
+        <div id="learn-empty" class="card empty" style="display:none">
+          <div>No results found</div>
+        </div>
+      </section>
+
+      <!-- PROFILE -->
+      <section class="page" id="page-profile" hidden>
+        <div class="page-head">
+          <div>
+            <h1 class="page-title">Profile</h1>
+            <div class="page-sub">Manage your account</div>
+          </div>
+        </div>
+        <div class="profile-grid">
+          <div class="card">
+            <h2 style="margin-bottom:16px">Account</h2>
+            <div style="margin-bottom:14px">
+              <label class="label">Username</label>
+              <input id="pf-username" class="input" value="aaravsharma">
+            </div>
+            <div style="margin-bottom:18px">
+              <label class="label">Email</label>
+              <input id="pf-email" class="input" type="email" value="aarav@example.com">
+              <div class="error-text" id="pf-email-err">Enter a valid email</div>
+            </div>
+            <button class="btn btn-subtle" id="change-pass-btn">Change Password</button>
+          </div>
+          <div class="card">
+            <h2 style="margin-bottom:16px">Preferences</h2>
+            <div class="pref-row">
+              <div class="label" style="margin:0">Age</div>
+              <input id="pf-age" class="input" type="number" min="18" max="70" value="22" style="max-width:120px">
+            </div>
+            <div class="pref-row">
+              <div class="label" style="margin:0">Income</div>
+              <input id="pf-income" class="input" value="₹1,16,667" style="max-width:180px">
+            </div>
+            <div class="pref-row">
+              <div class="label" style="margin:0">Risk</div>
+              <div class="pills" style="max-width:260px">
+                <button class="pill" data-pf-risk="Low" type="button">Low</button>
+                <button class="pill active" data-pf-risk="Medium" type="button">Medium</button>
+                <button class="pill" data-pf-risk="High" type="button">High</button>
+              </div>
+            </div>
+            <div style="display:flex;justify-content:flex-end;margin-top:20px">
+              <button class="btn btn-primary" id="pf-save" style="min-width:110px">Save</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+<script>
+(() => {
+  // STATE
+  const appState = {
+    user:{name:'Aarav',email:'aarav@example.com',username:'aaravsharma'},
+    profile:{age:22,income:116667,invest:20000,risk:'Medium'},
+    goals:[],
+    calculators:{
+      sip:{monthly:5000,rate:12,years:10},
+      fd:{principal:100000,rate:7,years:5},
+      retirement:{currentAge:30,retireAge:60,monthly:10000,rate:12}
+    },
+    ui:{page:'dashboard',calc:'sip',learnTab:'all',learnQuery:''}
+  };
+
+  
+  // FIREBASE AUTH INTEGRATION
+  let currentUser = null;
+  
+  window.addEventListener('firebase-ready', () => {
+    const { auth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } = window.fb;
+    
+    // Auth state listener
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        currentUser = user;
+        appState.user.email = user.email;
+        appState.user.uid = user.uid;
+        showApp();
+        loadUserData();
+      } else {
+        currentUser = null;
+        showLogin();
+      }
+    });
+    
+    // Login handler
+    $('#login-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const email = $('#login-email').value.trim();
+      const pass = $('#login-pass').value;
+      const btn = $('#login-btn');
+      
+      if (!email || !pass) return toast('Enter email and password');
+      
+      btn.disabled = true;
+      btn.innerHTML = '<div class="spinner"></div>';
+      
+      try {
+        await signInWithEmailAndPassword(auth, email, pass);
+        toast('Logged in');
+      } catch (err) {
+        if (err.code === 'auth/user-not-found') {
+          toast('No account found. Click Create account below');
+        } else if (err.code === 'auth/wrong-password') {
+          toast('Wrong password');
+        } else {
+          toast(err.message);
+        }
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Log in';
+      }
+    };
+    
+    // Signup handler
+    $('#show-signup')?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const email = $('#login-email').value.trim();
+      const pass = $('#login-pass').value;
+      if (!email || pass.length < 6) return toast('Email and 6+ char password required');
+      
+      const btn = $('#login-btn');
+      btn.disabled = true;
+      btn.innerHTML = '<div class="spinner"></div>';
+      
+      try {
+        await createUserWithEmailAndPassword(auth, email, pass);
+        toast('Account created');
+      } catch (err) {
+        toast(err.code === 'auth/email-already-in-use' ? 'Email already used' : err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Log in';
+      }
+    });
+    
+    // Logout
+    $('#logout').onclick = () => signOut(auth);
+  });
+  
+  async function loadUserData() {
+    if (!currentUser) return;
+    const { db, doc, getDoc } = window.fb;
+    const snap = await getDoc(doc(db, 'users', currentUser.uid));
+    if (snap.exists()) {
+      const data = snap.data();
+      if (data.profile) appState.profile = {...appState.profile, ...data.profile};
+      if (data.goals) appState.goals = data.goals;
+    }
+    renderAll();
+  }
+  
+  async function saveUserData() {
+    if (!currentUser) return;
+    const { db, doc, setDoc } = window.fb;
+    await setDoc(doc(db, 'users', currentUser.uid), {
+      profile: appState.profile,
+      goals: appState.goals,
+      updated: Date.now()
+    }, { merge: true });
+  }
+  
+  // Auto-save on changes
+  const _oldRenderGoals = renderGoals;
+  renderGoals = function() { _oldRenderGoals(); saveUserData(); }
+  
+
+  
+  // FIREBASE AUTH WITH TOGGLE
+  let currentUser = null;
+  let isLoginMode = true;
+  
+  window.addEventListener('firebase-ready', () => {
+    const { auth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, googleProvider, sendPasswordResetEmail, setPersistence, browserLocalPersistence, browserSessionPersistence } = window.fb;
+    
+    // Toggle between login/signup
+    function updateAuthMode(loginMode) {
+      isLoginMode = loginMode;
+      $('#auth-title').textContent = loginMode ? 'Welcome back' : 'Create account';
+      $('#auth-submit').textContent = loginMode ? 'Sign in' : 'Sign up';
+      $('#auth-toggle-text').textContent = loginMode ? "Don't have an account?" : 'Already have an account?';
+      $('#auth-toggle-link').textContent = loginMode ? 'Sign up' : 'Sign in';
+    }
+    
+    $('#auth-toggle-link').onclick = (e) => {
+      e.preventDefault();
+      updateAuthMode(!isLoginMode);
+    };
+    
+    // Auth form handler
+    $('#auth-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const email = $('#auth-email').value.trim();
+      const pass = $('#auth-pass').value;
+      const remember = $('#remember-me').checked;
+      const btn = $('#auth-submit');
+      
+      if (!email || pass.length < 6) return toast('Email and 6+ char password required');
+      
+      btn.disabled = true;
+      btn.innerHTML = '<div class="spinner"></div>';
+      
+      try {
+        await setPersistence(auth, remember ? browserLocalPersistence : browserSessionPersistence);
+        if (isLoginMode) {
+          await signInWithEmailAndPassword(auth, email, pass);
+          toast('Logged in');
+        } else {
+          await createUserWithEmailAndPassword(auth, email, pass);
+          toast('Account created');
+        }
+      } catch (err) {
+        if (err.code === 'auth/user-not-found') toast('No account found');
+        else if (err.code === 'auth/wrong-password') toast('Wrong password');
+        else if (err.code === 'auth/email-already-in-use') toast('Email already registered');
+        else toast(err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = isLoginMode ? 'Sign in' : 'Sign up';
+      }
+    };
+    
+    // Google sign in
+    $('#google-signin').onclick = async () => {
+      try {
+        await signInWithPopup(auth, googleProvider);
+        toast('Signed in with Google');
+      } catch (err) {
+        toast(err.message);
+      }
+    };
+    
+    // Forgot password
+    $('#forgot-pass').onclick = async (e) => {
+      e.preventDefault();
+      const email = $('#auth-email').value.trim();
+      if (!email) return toast('Enter your email first');
+      try {
+        await sendPasswordResetEmail(auth, email);
+        toast('Password reset email sent');
+      } catch (err) {
+        toast(err.message);
+      }
+    };
+  });
+
+  // UTILS
+  const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
+  const fmtINR=n=>new Intl.NumberFormat('en-IN',{maximumFractionDigits:0}).format(Math.round(n));
+  const fmtCurrency=n=>'₹'+fmtINR(n);
+  const fmtShort=n=>{if(n>=1e7)return(+(n/1e7).toFixed(2))+'Cr';if(n>=1e5)return(+(n/1e5).toFixed(1))+'L';return fmtCurrency(n)};
+  const debounce=(fn,d=100)=>{let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),d)}};
+  const clamp=(v,min,max)=>Math.min(Math.max(v,min),max);
+  const todayStr=()=>new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long'});
+
+  // LIFE STAGE
+  const lifeStage=a=>a<=25?'Early Career (18-25)':a<=35?'Building Wealth (26-35)':a<=50?'Peak Earning (36-50)':a<=60?'Pre-Retirement (51-60)':'Retirement (61-70)';
+
+  // ALLOCATION
+  function getAllocation(age,risk,invest){
+    let eq=62-(age-18)*0.90384615; // 62->15
+    if(risk==='Low')eq-=10; if(risk==='High')eq+=8;
+    eq=clamp(Math.round(eq),15,70);
+    const ins=5, pen=15;
+    let debt=100-eq-ins-pen;
+    if(debt<10){debt=10;eq=100-debt-ins-pen;}
+    const items=[
+      {key:'equity',name:'Equity Funds',icon:`<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#2563eb"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>`,pct:eq,amt:Math.round(invest*eq/100),ret:'12%'},
+      {key:'debt',name:'Debt & FD',icon:`<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#059669"><line x1="3" y1="22" x2="21" y2="22"/><line x1="6" y1="18" x2="6" y2="11"/><line x1="10" y1="18" x2="10" y2="11"/><line x1="14" y1="18" x2="14" y2="11"/><line x1="18" y1="18" x2="18" y2="11"/><polygon points="12 2 2 7 12 12 22 7 12 2"/></svg>`,pct:debt,amt:Math.round(invest*debt/100),ret:'7%'},
+      {key:'pension',name:'Pension',icon:`<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#7c3aed"><line x1="3" y1="22" x2="21" y2="22"/><line x1="6" y1="18" x2="6" y2="11"/><line x1="10" y1="18" x2="10" y2="11"/><line x1="14" y1="18" x2="14" y2="11"/><line x1="18" y1="18" x2="18" y2="11"/><polygon points="12 2 2 7 12 12 22 7 12 2"/></svg>`,pct:pen,amt:Math.round(invest*pen/100),ret:'8%'},
+      {key:'insurance',name:'Insurance',icon:`<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#dc2626"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,pct:ins,amt:Math.round(invest*ins/100),ret:'—'}
+    ];
+    const blended=(items[0].pct*12 + items[1].pct*7 + items[2].pct*8)/100;
+    return {items,blended};
+  }
+
+  // METRICS
+  function updateMetrics(){
+    const {income,invest,age,risk}=appState.profile;
+    const surplus=Math.round(income*0.3);
+    $('#m-surplus').textContent=fmtCurrency(surplus);
+    $('#m-surplus-sub').textContent=`30% of ${fmtCurrency(income)} income`;
+    const checks=[invest<=income*0.5,income>0,age>=18&&age<=70];
+    const passed=checks.filter(Boolean).length;
+    const score= passed===3?85:passed===2?70:55;
+    $('#m-health').textContent=score;
+    $('#m-health-sub').textContent=`${score>=80?'Excellent':score>=65?'Good':'Fair'} • ${passed}/3 checks passed`;
+    const alloc=getAllocation(age,risk,invest);
+    const i=alloc.blended/100/12, n=60;
+    const fv=invest*(((Math.pow(1+i,n)-1)/i)*(1+i));
+    $('#m-proj').textContent=fmtShort(fv);
+    $('#m-proj-sub').textContent=`At ${alloc.blended.toFixed(1)}% blended return`;
+  }
+
+  // RENDER ALLOCATION
+  function renderAllocation(){
+    const {age,invest,risk}=appState.profile;
+    const {items}=getAllocation(age,risk,invest);
+    $('#alloc-title').textContent=`Where your ${fmtCurrency(invest)} goes`;
+    $('#alloc-list').innerHTML=items.map(it=>`
+      <div class="alloc-row">
+        <div class="alloc-top">
+          <span style="display:flex;align-items:center">${it.icon}</span>
+          <div class="alloc-name">${it.name}</div>
+          <span class="alloc-pct">${it.pct}%</span>
+          <div class="alloc-amt">${fmtCurrency(it.amt)}</div>
+        </div>
+        <div class="progress thin"><span style="width:${it.pct}%"></span></div>
+        <div class="alloc-note">Expected ${it.ret} p.a.</div>
+      </div>`).join('');
+    $('#alloc-tip').textContent=`At age ${age}, we recommend higher equity. This automatically reduces 1% each year.`;
+  }
+
+  // DASHBOARD INIT
+  function initDashboard(){
+    $('#greeting').textContent=`Good morning, ${appState.user.name}`;
+    $('#today-date').textContent=todayStr();
+    $('#age-input').value=appState.profile.age;
+    $('#life-stage').textContent=lifeStage(appState.profile.age);
+    $('#income-input').value=fmtCurrency(appState.profile.income);
+    $('#invest-input').value=fmtCurrency(appState.profile.invest);
+    $$('.pill').forEach(b=>b.classList.toggle('active',b.dataset.risk===appState.profile.risk));
+    updateMetrics(); renderAllocation();
+  }
+
+  // AGE CONTROLS
+  $('#age-dec').onclick=()=>{const i=$('#age-input');i.value=clamp(+i.value-1,18,70);i.dispatchEvent(new Event('input'))};
+  $('#age-inc').onclick=()=>{const i=$('#age-input');i.value=clamp(+i.value+1,18,70);i.dispatchEvent(new Event('input'))};
+  $('#age-input').addEventListener('input',e=>{
+    let v=+e.target.value||18;
+    if(v>70)v=70; e.target.value=v;
+    $('#life-stage').textContent=lifeStage(v);
+    const err=$('#age-err'); err.classList.remove('show');
+  });
+  $('#age-input').addEventListener('blur',e=>{
+    let v=+e.target.value||18;
+    const err=$('#age-err');
+    if(v<18){v=18;err.textContent='Minimum age is 18';err.classList.add('show');}
+    else if(v>70){v=70;err.textContent='Maximum age is 70';err.classList.add('show');}
+    else err.classList.remove('show');
+    e.target.value=v; $('#life-stage').textContent=lifeStage(v);
+    validateInvest();
+  });
+
+  // INCOME
+  function parseINR(s){return +String(s).replace(/[^\d]/g,'')||0}
+  $('#income-input').addEventListener('blur',e=>{
+    const v=parseINR(e.target.value); e.target.value=fmtCurrency(v); appState.profile.income=v; validateInvest(); updateMetrics();
+  });
+  $('#income-input').addEventListener('focus',e=>{e.target.value=parseINR(e.target.value)});
+
+  // INVEST
+  $('#invest-input').addEventListener('input',validateInvest);
+  $('#invest-input').addEventListener('blur',e=>{
+    const v=parseINR(e.target.value); e.target.value=fmtCurrency(v); appState.profile.invest=v; validateInvest(); renderAllocation(); updateMetrics();
+  });
+  $('#invest-input').addEventListener('focus',e=>{e.target.value=parseINR(e.target.value)});
+  function validateInvest(){
+    const inc=parseINR($('#income-input').value), inv=parseINR($('#invest-input').value);
+    const err=$('#invest-err'), inp=$('#invest-input'), btn=$('#update-plan');
+    const invalid=inv>inc||inv<=0;
+    inp.classList.toggle('input-error',invalid);
+    err.classList.toggle('show',inv>inc);
+    btn.disabled=invalid;
+    return !invalid;
+  }
+
+  // RISK PILLS
+  $$('.pill[data-risk]').forEach(b=>b.onclick=()=>{
+    $$('.pill[data-risk]').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active'); appState.profile.risk=b.dataset.risk;
+  });
+
+  // UPDATE PLAN
+  $('#update-plan').onclick=async()=>{
+    if(!validateInvest())return;
+    const btn=$('#update-plan'); const orig=btn.innerHTML;
+    btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Updating';
+    appState.profile.age=+$('#age-input').value;
+    appState.profile.income=parseINR($('#income-input').value);
+    appState.profile.invest=parseINR($('#invest-input').value);
+    await new Promise(r=>setTimeout(r,350));
+    renderAllocation(); updateMetrics();
+    syncProfilePage();
+    btn.disabled=false; btn.innerHTML=orig;
+    toast('Plan updated');
+  };
+
+  // NAV
+  $$('.nav-btn').forEach(b=>b.onclick=()=>{
+    $$('.nav-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active');
+    const p=b.dataset.page; appState.ui.page=p;
+    $$('.page').forEach(s=>s.hidden=true); $('#page-'+p).hidden=false;
+    if(p==='goals')renderGoals();
+    if(p==='calculators')renderCalc();
+    if(p==='learn')renderLearn();
+    if(p==='profile')syncProfilePage();
+  });
+
+  // GOALS
+  const goalsGrid=$('#goals-grid'), goalsEmpty=$('#goals-empty');
+  function renderGoals(){
+    if(appState.goals.length===0){goalsEmpty.style.display='block'; goalsGrid.style.display='none'; return;}
+    goalsEmpty.style.display='none'; goalsGrid.style.display='grid';
+    goalsGrid.innerHTML=appState.goals.map(g=>{
+      const pct=Math.min(100,Math.round(g.saved/g.target*100));
+      const months=Math.max(1,Math.ceil((g.target-g.saved)/g.monthly));
+      return `<div class="card goal-card" data-id="${g.id}">
+        <div class="goal-top">
+          <div class="goal-name">${g.name}</div>
+          <div class="priority-dot ${g.priority}"></div>
+          <button class="kebab" aria-label="Menu"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button>
+          <div class="kebab-menu"><button class="kebab-item" data-act="edit">Edit</button><button class="kebab-item" data-act="del">Delete</button></div>
+        </doom></div>`.replace('</doom>','')+`
+        <div class="goal-progress-text"><span>${fmtCurrency(g.saved)} of ${fmtCurrency(g.target)}</span><span>${pct}%</span></div>
+        <div class="progress"><span style="width:${pct}%"></span></div>
+        <div class="goal-bottom">
+          <span>${fmtCurrency(g.monthly)}/mo • ${months} months</span>
+          <span class="add-funds" data-act="fund">Add Funds</span>
+        </div>
+        <div class="funds-inline" style="display:none"><input class="input" type="number" placeholder="Amount" style="max-width:140px"><button class="btn btn-primary" data-act="save-fund">Save</button><button class="btn btn-ghost" data-act="cancel-fund">Cancel</button></div>
+      </div>`;
+    }).join('');
+    // events
+    goalsGrid.querySelectorAll('.kebab').forEach(k=>k.onclick=e=>{e.stopPropagation(); const m=k.nextElementSibling; $$('.kebab-menu').forEach(x=>x!==m&&x.classList.remove('show')); m.classList.toggle('show')});
+    document.addEventListener('click',()=>$$('.kebab-menu').forEach(m=>m.classList.remove('show')),{once:false});
+    goalsGrid.querySelectorAll('[data-act]').forEach(btn=>btn.onclick=e=>{
+      const card=e.target.closest('.goal-card'); const id=card.dataset.id; const g=appState.goals.find(x=>x.id==id);
+      if(btn.dataset.act==='edit')openGoalModal(g);
+      if(btn.dataset.act==='del'){appState.goals=appState.goals.filter(x=>x.id!=id);renderGoals();toast('Goal deleted');}
+      if(btn.dataset.act==='fund'){card.querySelector('.funds-inline').style.display='flex';}
+      if(btn.dataset.act==='cancel-fund'){card.querySelector('.funds-inline').style.display='none';}
+      if(btn.dataset.act==='save-fund'){const val=+card.querySelector('.funds-inline input').value||0; g.saved=Math.min(g.target,g.saved+val); g.monthly=Math.ceil((g.target-g.saved)/g.monthsLeft); renderGoals(); toast('Funds added');}
+    });
+  }
+  $('#add-goal-btn').onclick=()=>openGoalModal();
+
+  function openGoalModal(g){
+    const isEdit=!!g;
+    const m=createModal(isEdit?'Edit Goal':'Add Goal',`
+      <form id="goal-form">
+        <div style="margin-bottom:14px"><label class="label">Goal name</label><input class="input" id="g-name" required value="${g?.name||''}" placeholder="e.g., Car"></div>
+        <div style="margin-bottom:14px"><label class="label">Target amount</label><input class="input" id="g-target" inputmode="numeric" required value="${g?fmtCurrency(g.target):''}" placeholder="₹3,00,000"></div>
+        <div style="margin-bottom:14px"><label class="label">Time (months)</label><input class="input" id="g-months" type="number" min="1" max="360" required value="${g?.monthsLeft||36}"></div>
+        <div><label class="label">Priority</label><select class="select" id="g-priority"><option value="green">Low</option><option value="yellow">Medium</option><option value="red">High</option></select></div>
+      </form>`,[{label:'Cancel',type:'ghost',action:'close'},{label:isEdit?'Save':'Add Goal',type:'primary',action:'submit'}]);
+    if(g)$('#g-priority').value=g.priority;
+    m.querySelector('[data-action="submit"]').onclick=()=>{
+      const name=$('#g-name').value.trim(), target=parseINR($('#g-target').value), months=+$('#g-months').value, priority=$('#g-priority').value;
+      if(!name||!target||!months)return;
+      if(isEdit){g.name=name;g.target=target;g.monthsLeft=months;g.priority=priority;g.monthly=Math.ceil((g.target-g.saved)/months);}
+      else{appState.goals.push({id:Date.now(),name,target,saved:0,monthsLeft:months,priority,monthly:Math.ceil(target/months)});}
+      closeModal(); renderGoals(); toast(isEdit?'Goal updated':'Goal added');
+    };
+    $('#g-target').addEventListener('blur',e=>e.target.value=fmtCurrency(parseINR(e.target.value)));
+    $('#g-target').addEventListener('focus',e=>e.target.value=parseINR(e.target.value));
+  }
+
+  // CALCULATORS
+  $$('.seg-btn').forEach(b=>b.onclick=()=>{$$('.seg-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');appState.ui.calc=b.dataset.calc;renderCalc()});
+  function calcInput(label,key,obj,min,max,step,format=v=>v){
+    return `<div class="calc-row">
+      <label class="label">${label}</label>
+      <div class="calc-input-wrap">
+        <input type="range" class="slider" min="${min}" max="${max}" step="${step}" value="${obj[key]}" data-key="${key}">
+        <input class="input" type="number" min="${min}" max="${max}" step="${step}" value="${obj[key]}" data-key="${key}">
+      </div>
+    </div>`;
+  }
+  function renderCalc(){
+    const type=appState.ui.calc, left=$('#calc-left');
+    if(type==='sip'){
+      const s=appState.calculators.sip;
+      left.innerHTML=calcInput('Monthly investment', 'monthly', s, 500,100000,500)+calcInput('Expected return %', 'rate', s, 1,30,0.5)+calcInput('Time period (years)', 'years', s,1,30,1);
+      updateSip();
+      bindCalc(s,updateSip);
+    }else if(type==='fd'){
+      const f=appState.calculators.fd;
+      left.innerHTML=calcInput('Principal', 'principal', f, 10000,10000000,10000)+calcInput('Rate % p.a.', 'rate', f,1,15,0.1)+calcInput('Years', 'years', f,1,20,1);
+      updateFd(); bindCalc(f,updateFd);
+    }else{
+      const r=appState.calculators.retirement;
+      left.innerHTML=calcInput('Current age','currentAge',r,18,60,1)+calcInput('Retire at','retireAge',r,25,70,1)+calcInput('Monthly SIP','monthly',r,1000,200000,500)+calcInput('Return %','rate',r,1,20,0.5);
+      updateRet(); bindCalc(r,updateRet);
+    }
+  }
+  function bindCalc(obj,fn){const d=debounce(fn,100);$$('#calc-left input').forEach(i=>{i.oninput=e=>{const k=i.dataset.key; obj[k]=+e.target.value; $$('#calc-left input[data-key="'+k+'"]').forEach(x=>x.value=obj[k]); d()}})}
+  function updateSip(){
+    const {monthly,rate,years}=appState.calculators.sip;
+    const i=rate/100/12,n=years*12;
+    const fv=monthly*(((Math.pow(1+i,n)-1)/i)*(1+i));
+    const invest=monthly*n;
+    $('#calc-result-big').textContent=fmtCurrency(fv);
+    $('#calc-invest').textContent=fmtCurrency(invest);
+    $('#calc-gain').textContent=fmtCurrency(fv-invest);
+  }
+  function updateFd(){
+    const {principal,rate,years}=appState.calculators.fd;
+    const a=principal*Math.pow(1+rate/100/4,4*years);
+    $('#calc-result-big').textContent=fmtCurrency(a);
+    $('#calc-invest').textContent=fmtCurrency(principal);
+    $('#calc-gain').textContent=fmtCurrency(a-principal);
+  }
+  function updateRet(){
+    const {currentAge,retireAge,monthly,rate}=appState.calculators.retirement;
+    const years=Math.max(1,retireAge-currentAge),i=rate/100/12,n=years*12;
+    const fv=monthly*(((Math.pow(1+i,n)-1)/i)*(1+i));
+    const invest=monthly*n;
+    $('#calc-result-big').textContent=fmtCurrency(fv);
+    $('#calc-invest').textContent=fmtCurrency(invest);
+    $('#calc-gain').textContent=fmtCurrency(fv-invest);
+  }
+
+  // LEARN DATA
+  const blogs=[
+    {id:1,title:'SIP Mistakes That Cost Lakhs',excerpt:'Most investors start SIPs but stop them early. Learn why consistency beats timing.',time:'6 min',tag:'BLOG',content:`<div class="article-prose"><h3>Why SIPs Fail</h3><p>Systematic Investment Plans work because of rupee-cost averaging and compounding. Yet Indian investors redeem early, often during market dips. This single behavior can reduce final wealth by 30-40%.</p><h4>Three Common Errors</h4><ul><li><strong>Stopping in bear markets:</strong> You buy more units when prices fall. Pausing SIPs destroys the averaging benefit.</li><li><strong>Chasing last year's top fund:</strong> Performance is cyclical. Stick to consistent large-cap or flexi-cap funds for core allocation.</li><li><strong>No step-up:</strong> Increase SIP by 10% yearly as income grows. A ₹5,000 SIP at 12% for 20 years becomes ₹50L. With 10% step-up, it becomes ₹98L.</li></ul><h3>How to Build Discipline</h3><p>Automate debit on salary day. Treat SIP like rent – non-negotiable. Review only once a year, not daily NAVs. Use separate folios for separate goals to avoid temptation.</p><p>Final checklist: start early, never pause, step-up annually, review asset allocation at 30, 40, 50. This simple framework has created more crorepatis than stock tips.</p></div>`},
+    {id:2,title:'Emergency Fund: Your Financial Airbag',excerpt:'3–6 months expenses in liquid funds can prevent debt spirals.',time:'4 min',tag:'BLOG',content:`<div class="article-prose"><h3>The Real Safety Net</h3><p>Before equities, build liquidity. Job loss, medical bills, or family needs should not force you to break investments at a loss.</p><ul><li>Target 6 months of essential expenses</li><li>Park in liquid mutual funds or high-yield savings, not FDs</li><li>Refill immediately after use</li></ul></div>`},
+    {id:3,title:'Term Insurance at 28 vs 38',excerpt:'Same cover, double premium. Age is your biggest discount.',time:'5 min',tag:'BLOG',content:`<div class="article-prose"><p>Buy pure term insurance early. A ₹1Cr cover at 28 costs ~₹700/month; at 38 it is ~₹1,500. Health also deteriorates.</p></div>`},
+    {id:4,title:'NPS Tier 1 vs PPF',excerpt:'Both offer 80C and retirement focus, but liquidity and returns differ.',time:'7 min',tag:'BLOG',content:`<div class="article-prose"><p>Compare lock-in, equity exposure, and annuity rules before choosing.</p></div>`},
+    {id:5,title:'Debt Funds After Tax Changes',excerpt:'Indexation removal changes holding strategies.',time:'5 min',tag:'BLOG',content:`<div class="article-prose"><p>Consider arbitrage and short-duration for tax efficiency.</p></div>`},
+    {id:6,title:'House Down Payment Planning',excerpt:'5-year goal needs hybrid allocation, not full equity.',time:'6 min',tag:'BLOG',content:`<div class="article-prose"><p>Use 40:60 equity-debt for 3-5 year goals.</p></div>`},
+  ];
+  const schemes=[
+    {id:1,name:'Public Provident Fund (PPF)',stat:'7.1% • Tax-free',benefit:'15-year sovereign savings with EEE tax status',rate:'7.1%',lock:'15 yrs',tax:'EEE',limit:'₹1.5L/yr',who:'All Indian residents',how:'Post office / banks',official:'https://www.indiapost.gov.in/Financial/Pages/Content/PPF.aspx'},
+    {id:2,name:'Sukanya Samriddhi Yojana',stat:'8.2% • Girl child',benefit:'Highest small-savings rate for daughters',rate:'8.2%',lock:'21 yrs',tax:'EEE',limit:'₹1.5L/yr',who:'Parents of girl <10',how:'Post office',official:'https://www.indiapost.gov.in/Financial/Pages/Content/ssy.aspx'},
+    {id:3,name:'NPS Tier I',stat:'Market-linked • 80CCD',benefit:'Low-cost retirement with equity option',rate:'9-12% est',lock:'Till 60',tax:'EET',limit:'No limit',who:'18-70 yrs',how:'npscra.nsdl.co.in',official:'https://enps.nsdl.com/'},
+    {id:4,name:'EPF',stat:'8.25% • Salaried',benefit:'Employer match, tax-free',rate:'8.25%',lock:'Till retirement',tax:'EEE',limit:'12% salary',who:'Salaried',how:'Via employer',official:'https://www.epfindia.gov.in/'},
+    {id:5,name:'Senior Citizens Savings',stat:'8.2% • Quarterly',benefit:'Safe income for 60+',rate:'8.2%',lock:'5 yrs',tax:'Taxable',limit:'₹30L',who:'60+ yrs',how:'Post office',official:'https://www.indiapost.gov.in/Financial/Pages/Content/SCSS.aspx'},
+    {id:6,name:'RBI Floating Rate Bonds',stat:'8.05% • 7yr',benefit:'Sovereign, rate resets',rate:'8.05%',lock:'7 yrs',tax:'Taxable',limit:'No limit',who:'Residents',how:'Banks',official:'https://www.rbi.org.in/'},
+    {id:7,name:'Mahila Samman Certificate',stat:'7.5% • 2yr',benefit:'Women-only short deposit',rate:'7.5%',lock:'2 yrs',tax:'Taxable',limit:'₹2L',who:'Women',how:'Post office',official:'https://www.indiapost.gov.in/'},
+    {id:8,name:'Kisan Vikas Patra',stat:'Doubles in 115m',benefit:'No PAN, simple',rate:'7.5%',lock:'115m',tax:'Taxable',limit:'No limit',who:'Residents',how:'Post office',official:'https://www.indiapost.gov.in/Financial/Pages/Content/KVP.aspx'}
+  ];
+  const news=[
+    {id:1,date:'12 Apr 2026',title:'RBI holds repo at 6.5%',source:'Mint',summary:'Status quo supports growth; EMIs likely stable next quarter.'},
+    {id:2,date:'10 Apr 2026',title:'NPS partial withdrawal eased',source:'ET',summary:'Digital requests now processed in T+2 days.'},
+    {id:3,date:'8 Apr 2026',title:'Mutual fund SIPs hit new high',source:'Business Standard',summary:'Monthly flows cross ₹26,000Cr in March.'},
+    {id:4,date:'5 Apr 2026',title:'PPF rate unchanged at 7.1%',source:'PIB',summary:'Govt keeps small savings rates steady for Q1 FY27.'},
+  ];
+  function renderLearn(){
+    const q=appState.ui.learnQuery.toLowerCase(), tab=appState.ui.learnTab;
+    const items=[
+      ...blogs.map(b=>({...b,type:'blogs'})),
+      ...schemes.map(s=>({...s,type:'schemes'})),
+      ...news.map(n=>({...n,type:'news'}))
+    ].filter(it=>tab==='all'||it.type===tab).filter(it=>(it.title+it.name+it.excerpt+it.summary||'').toLowerCase().includes(q));
+    const grid=$('#learn-grid'), empty=$('#learn-empty');
+    if(items.length===0){grid.style.display='none';empty.style.display='block';return}
+    grid.style.display='grid';empty.style.display='none';
+    grid.innerHTML=items.map(it=>{
+      if(it.type==='blogs')return `<article class="card learn-card" data-id="${it.id}" data-type="blogs">
+        <div class="learn-tag blog">BLOG</div><div class="learn-title">${it.title}</div>
+        <div class="learn-excerpt">${it.excerpt}</div>
+        <div class="learn-meta"><span>${it.time} read</span><span>Read →</span></div>
+      </article>`;
+      if(it.type==='schemes')return `<article class="card learn-card" data-id="${it.id}" data-type="schemes">
+        <div class="learn-tag govt">GOVT</div><div class="learn-title">${it.name}</div>
+        <div class="learn-excerpt" style="-webkit-line-clamp:1">${it.stat} • ${it.benefit}</div>
+        <div class="learn-links"><a href="#" data-act="summary">Summary</a><a href="#" data-act="official" title="Open official government site">Official ↗</a></div>
+      </article>`;
+      return `<article class="card learn-card" data-id="${it.id}" data-type="news">
+        <div class="learn-tag news">NEWS • ${it.date}</div><div class="learn-title">${it.title}</div>
+        <div class="learn-excerpt">${it.summary}</div>
+        <div class="learn-meta"><span>${it.source}</span></div>
+      </article>`;
+    }).join('');
+    grid.querySelectorAll('.learn-card').forEach(c=>c.onclick=e=>{
+      if(e.target.dataset.act==='summary'){e.preventDefault(); const s=schemes.find(x=>x.id==c.dataset.id); openScheme(s); return}
+      if(e.target.dataset.act==='official'){e.preventDefault(); const s=schemes.find(x=>x.id==c.dataset.id); if(s && s.official){window.open(s.official,'_blank');} return}
+      if(c.dataset.type==='blogs'){const b=blogs.find(x=>x.id==c.dataset.id); openBlog(b)}
+    });
+  }
+  $$('.tab').forEach(t=>t.onclick=()=>{$$('.tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');appState.ui.learnTab=t.dataset.tab;renderLearn()});
+  $('#learn-search').oninput=debounce(e=>{appState.ui.learnQuery=e.target.value;renderLearn()},150);
+
+  function openBlog(b){
+    createModal(b.title,`<div style="color:var(--text-2);font-size:13px;margin-bottom:12px">${b.time} read • PragyaBodha Learn</div>${b.content}`,[{label:'Close',type:'ghost',action:'close'}],true)
+  }
+  function openScheme(s){
+    createModal(s.name,`<table style="width:100%;border-collapse:collapse;font-size:14px">
+      <tr><td style="padding:8px 0;color:#6b7280">Rate</td><td style="padding:8px 0;font-weight:500;text-align:right">${s.rate}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;border-top:1px solid #f3f4f6">Lock-in</td><td style="padding:8px 0;font-weight:500;text-align:right;border-top:1px solid #f3f4f6">${s.lock}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;border-top:1px solid #f3f4f6">Tax</td><td style="padding:8px 0;font-weight:500;text-align:right;border-top:1px solid #f3f4f6">${s.tax}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;border-top:1px solid #f3f4f6">Limit</td><td style="padding:8px 0;font-weight:500;text-align:right;border-top:1px solid #f3f4f6">${s.limit}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;border-top:1px solid #f3f4f6">Who for</td><td style="padding:8px 0;font-weight:500;text-align:right;border-top:1px solid #f3f4f6">${s.who}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;border-top:1px solid #f3f4f6">How to open</td><td style="padding:8px 0;font-weight:500;text-align:right;border-top:1px solid #f3f4f6">${s.how}</td></tr>
+    </table>`,[{label:'Close',type:'primary',action:'close'}])
+  }
+
+  // PROFILE
+  function syncProfilePage(){
+    $('#pf-username').value=appState.user.username;
+    $('#pf-email').value=appState.user.email;
+    $('#pf-age').value=appState.profile.age;
+    $('#pf-income').value=fmtCurrency(appState.profile.income);
+    $$('[data-pf-risk]').forEach(b=>b.classList.toggle('active',b.dataset.pfRisk===appState.profile.risk));
+  }
+  $('#pf-email').addEventListener('blur',e=>{
+    const v=e.target.value.trim(), ok=/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+    e.target.classList.toggle('input-error',!ok); $('#pf-email-err').classList.toggle('show',!ok);
+    if(ok)appState.user.email=v;
+  });
+  $$('[data-pf-risk]').forEach(b=>b.onclick=()=>{$$('[data-pf-risk]').forEach(x=>x.classList.remove('active'));b.classList.add('active')});
+  $('#pf-income').addEventListener('blur',e=>e.target.value=fmtCurrency(parseINR(e.target.value)));
+  $('#pf-income').addEventListener('focus',e=>e.target.value=parseINR(e.target.value));
+  $('#pf-save').onclick=async()=>{
+    const btn=$('#pf-save'), orig=btn.textContent;
+    btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Saving';
+    await new Promise(r=>setTimeout(r,400));
+    appState.profile.age=+$('#pf-age').value;
+    appState.profile.income=parseINR($('#pf-income').value);
+    appState.profile.risk=$('[data-pf-risk].active').dataset.pfRisk;
+    $('#age-input').value=appState.profile.age; $('#income-input').value=fmtCurrency(appState.profile.income);
+    $$('.pill').forEach(b=>b.classList.toggle('active',b.dataset.risk===appState.profile.risk));
+    renderAllocation(); updateMetrics();
+    btn.innerHTML='Saved ✓'; setTimeout(()=>{btn.innerHTML=orig;btn.disabled=false},2000); toast('Preferences saved');
+  };
+  $('#change-pass-btn').onclick=()=>{
+    const m=createModal('Change Password',`
+      <div style="margin-bottom:12px"><label class="label">New password</label><input id="np-pass" type="password" class="input" placeholder="At least 8 characters"></div>
+      <div id="pass-check" style="display:grid;gap:6px;font-size:13px;color:#6b7280;margin-bottom:12px">
+        <div data-c="len">• 8+ characters</div>
+        <div data-c="up">• Uppercase letter</div>
+        <div data-c="low">• Lowercase letter</div>
+        <div data-c="num">• Number</div>
+      </div>
+      <div><label class="label">Confirm password</label><input id="np-pass2" type="password" class="input"></div>
+    `,[{label:'Cancel',type:'ghost',action:'close'},{label:'Update',type:'primary',action:'save'}]);
+    const p1=$('#np-pass'), checks=m.querySelectorAll('#pass-check div');
+    p1.oninput=()=>{
+      const v=p1.value; const tests={len:v.length>=8,up:/[A-Z]/.test(v),low:/[a-z]/.test(v),num:/\d/.test(v)};
+      checks.forEach(c=>{const ok=tests[c.dataset.c]; c.style.color=ok?'var(--success)':'#6b7280'; c.style.fontWeight=ok?'500':'400'});
+    };
+    m.querySelector('[data-action="save"]').onclick=()=>{if(p1.value.length>=8){closeModal();toast('Password updated')}else{p1.classList.add('input-error')}};
+  };
+
+  // MODAL SYSTEM
+  function createModal(title,body,actions=[],large=false){
+    const root=$('#modal-root'); root.innerHTML=`<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal" style="max-width:${large?720:520}px"><div class="modal-head"><h3>${title}</h3><button class="modal-close" aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div><div class="modal-body">${body}</div><div class="modal-foot">${actions.map(a=>`<button class="btn ${a.type==='primary'?'btn-primary':'btn-ghost'}" data-action="${a.action}">${a.label}</button>`).join('')}</div></div></div>`;
+    const bd=root.firstElementChild; requestAnimationFrame(()=>bd.classList.add('show'));
+    const close=()=>{bd.classList.remove('show');setTimeout(()=>root.innerHTML='',200)};
+    bd.onclick=e=>{if(e.target===bd)close()}; bd.querySelector('.modal-close').onclick=close; bd.querySelectorAll('[data-action="close"]').forEach(b=>b.onclick=close);
+    const trap=e=>{if(e.key==='Escape')close(); if(e.key==='Tab'){const f=bd.querySelectorAll('button,input,select,textarea,a[href]');if(!f.length)return;const first=f[0],last=f[f.length-1];if(e.shiftKey&&document.activeElement===first){last.focus();e.preventDefault()}else if(!e.shiftKey&&document.activeElement===last){first.focus();e.preventDefault()}}};
+    document.addEventListener('keydown',trap); bd._trap=trap;
+    setTimeout(()=>bd.querySelector('input,button')?.focus(),50);
+    return bd;
+  }
+  function closeModal(){const bd=document.querySelector('.modal-backdrop');if(bd){document.removeEventListener('keydown',bd._trap);bd.classList.remove('show');setTimeout(()=>$('#modal-root').innerHTML='',200)}}
+
+  // TOAST
+  function toast(msg){const c=$('#toast-container'); const el=document.createElement('div'); el.className='toast'; el.innerHTML=`<svg class="icon" style="color:#10b981" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg><span>${msg}</span>`; c.appendChild(el); setTimeout(()=>{el.classList.add('hide');setTimeout(()=>el.remove(),200)},2000)}
+
+  // LOGIN
+  $('#login-form').onsubmit=e=>{
+    e.preventDefault();
+    const email=$('#login-email').value.trim(), pass=$('#login-pass').value;
+    const eOk=/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    $('#login-email').classList.toggle('input-error',!eOk); $('#login-email-err').classList.toggle('show',!eOk);
+    if(!eOk||!pass)return;
+    $('#login-btn').disabled=true; $('#login-btn').innerHTML='<span class="spinner"></span> Signing in';
+    setTimeout(()=>{
+      appState.user.email=email; appState.user.name=email.split('@')[0].replace(/[^a-z]/gi,''); appState.user.name=appState.user.name.charAt(0).toUpperCase()+appState.user.name.slice(1);
+      $('#login-view').style.display='none'; $('#app-view').style.display='block';
+      initDashboard(); history.pushState({logged:true},'','/');
+    },250);
+  };
+
+  // LOGOUT
+  $('#logout').onclick=()=>{
+    $('#app-view').style.display='none'; $('#login-view').style.display='flex';
+    $('#login-btn').disabled=false; $('#login-btn').textContent='Log in'; $('#login-form').reset();
+    history.replaceState({},'','/'); toast('Logged out');
+  };
+  window.addEventListener('popstate',e=>{if(!e.state?.logged && $('#app-view').style.display!=='none'){history.pushState({logged:true},'','/')}});
+
+  // INIT
+  initDashboard(); renderCalc(); renderLearn();
+  // prevent form enter submit when invalid
+  document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT'&&e.target.form){const f=e.target.form;if(!f.checkValidity()){e.preventDefault()}}});
+})();
+</script>
+</body>
+</html>
